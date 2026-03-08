@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Claude Usage Monitor",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Displays Claude.ai usage limits in real time from your active session.",
   "permissions": [
     "storage",
