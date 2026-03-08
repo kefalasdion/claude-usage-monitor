@@ -1,58 +1,71 @@
 /**
  * Content script injected into claude.ai pages.
  *
+ * Real API (discovered by inspection):
+ *   GET /api/organizations/{orgId}/usage
+ *   → { five_hour: { utilization: 46, resets_at: "..." },
+ *        seven_day: { utilization: 20, resets_at: "..." },
+ *        seven_day_sonnet: { utilization: 4, resets_at: "..." }, ... }
+ *
+ *   GET /api/organizations/{orgId}/rate_limits
+ *   → { rate_limit_tier: "default_claude_max_5x", ... }
+ *
  * Strategy:
- *  1. Intercept fetch/XHR responses that contain usage/limit data.
- *  2. Parse and forward the data to the background service worker.
- *  3. Also trigger a manual fetch of the usage endpoint when the page loads
- *     and every 60 seconds while the tab is active.
+ *  1. Intercept every fetch/XHR to extract the org UUID from the URL.
+ *  2. Once we have the org UUID, directly fetch the usage + rate_limits endpoints.
+ *  3. Forward parsed data to the background service worker.
+ *  4. Re-probe every 60 s while the tab is visible.
  */
 
 (() => {
   'use strict';
 
-  // Known endpoint patterns that carry usage data on claude.ai
-  const USAGE_PATTERNS = [
-    /\/api\/organizations\/[^/]+\/usage/,
-    /\/api\/organizations\/[^/]+\/limits/,
-    /\/api\/usage/,
-    /\/api\/account\/usage/,
-    /\/api\/bootstrap/,
-    /\/api\/auth\/session/,
-  ];
+  let orgId = null;           // discovered from intercepted URLs
+  let probeInterval = null;
 
-  // ── Intercept fetch ─────────────────────────────────────────────────────────
+  // ── Extract org UUID from any API URL ───────────────────────────────────
+  const ORG_RE = /\/api\/organizations\/([\w-]{36})\//;
+
+  function tryExtractOrgId(url) {
+    if (orgId) return;
+    const m = (typeof url === 'string' ? url : '').match(ORG_RE);
+    if (m) {
+      orgId = m[1];
+      // Immediately probe now that we have the ID
+      probeUsage();
+    }
+  }
+
+  // ── Patch fetch ─────────────────────────────────────────────────────────
   const originalFetch = window.fetch;
   window.fetch = async function (...args) {
+    const url = typeof args[0] === 'string' ? args[0] : args[0]?.url || '';
+    tryExtractOrgId(url);
+
     const response = await originalFetch.apply(this, args);
 
-    try {
-      const url = typeof args[0] === 'string' ? args[0] : args[0]?.url || '';
-      if (USAGE_PATTERNS.some((p) => p.test(url))) {
-        const clone = response.clone();
-        clone.json().then((data) => {
-          forwardToBackground(url, data);
-        }).catch(() => {});
-      }
-    } catch (_) {}
+    // Also capture the usage response directly if we happen to intercept it
+    if (/\/api\/organizations\/[\w-]+\/usage/.test(url) && response.ok) {
+      response.clone().json().then((data) => {
+        handleUsageResponse(data);
+      }).catch(() => {});
+    }
 
     return response;
   };
 
-  // ── Intercept XMLHttpRequest ─────────────────────────────────────────────
+  // ── Patch XMLHttpRequest ────────────────────────────────────────────────
   const OriginalXHR = window.XMLHttpRequest;
   class PatchedXHR extends OriginalXHR {
     open(method, url, ...rest) {
-      this._monitorUrl = url;
+      this._url = url;
+      tryExtractOrgId(url);
       super.open(method, url, ...rest);
     }
     send(...args) {
-      if (this._monitorUrl && USAGE_PATTERNS.some((p) => p.test(this._monitorUrl))) {
+      if (this._url && /\/api\/organizations\/[\w-]+\/usage/.test(this._url)) {
         this.addEventListener('load', () => {
-          try {
-            const data = JSON.parse(this.responseText);
-            forwardToBackground(this._monitorUrl, data);
-          } catch (_) {}
+          try { handleUsageResponse(JSON.parse(this.responseText)); } catch (_) {}
         });
       }
       super.send(...args);
@@ -60,128 +73,111 @@
   }
   window.XMLHttpRequest = PatchedXHR;
 
-  // ── Forward parsed data to background ───────────────────────────────────
-  function forwardToBackground(url, data) {
-    const usage = extractUsage(url, data);
-    if (usage) {
-      chrome.runtime.sendMessage({ type: 'USAGE_DATA', payload: usage }).catch(() => {});
+  // ── Parse the real usage response shape ─────────────────────────────────
+  function handleUsageResponse(data) {
+    if (!data || typeof data !== 'object') return;
+
+    const toWindow = (w) => w
+      ? { utilization: w.utilization ?? null, resetsAt: w.resets_at ?? null }
+      : null;
+
+    const payload = {
+      fiveHour:     toWindow(data.five_hour),
+      sevenDay:     toWindow(data.seven_day),
+      sevenDaySonnet: toWindow(data.seven_day_sonnet) || undefined,
+    };
+
+    // Only send if we have at least one real value
+    if (payload.fiveHour?.utilization != null || payload.sevenDay?.utilization != null) {
+      chrome.runtime.sendMessage({ type: 'USAGE_DATA', payload }).catch(() => {});
     }
   }
 
-  // ── Extract usage fields from various response shapes ───────────────────
-  function extractUsage(url, data) {
-    if (!data || typeof data !== 'object') return null;
-
-    // Shape 1: { messageLimit: { used, limit, resetsAt }, plan: { name } }
-    if (data.messageLimit || data.message_limit) {
-      const ml = data.messageLimit || data.message_limit;
-      return {
-        planName: data.plan?.name || data.planName || data.plan_name || null,
-        used: ml.used ?? ml.messagesUsed ?? null,
-        limit: ml.limit ?? ml.messageLimit ?? ml.maxMessages ?? null,
-        resetsAt: ml.resetsAt ?? ml.resetAt ?? ml.reset_at ?? null,
-        raw: { url, data },
-      };
-    }
-
-    // Shape 2: array of usage objects
-    if (Array.isArray(data)) {
-      for (const item of data) {
-        const result = extractUsage(url, item);
-        if (result) return result;
-      }
-    }
-
-    // Shape 3: nested under account/limits/usage keys
-    for (const key of ['account', 'limits', 'usage', 'rateLimits', 'rate_limits']) {
-      if (data[key]) {
-        const result = extractUsage(url, data[key]);
-        if (result) return result;
-      }
-    }
-
-    // Shape 4: flat { used, limit, resetsAt } with numeric used/limit
-    if (
-      typeof data.used === 'number' &&
-      typeof data.limit === 'number'
-    ) {
-      return {
-        planName: data.planName || data.plan?.name || null,
-        used: data.used,
-        limit: data.limit,
-        resetsAt: data.resetsAt || data.resetAt || data.reset_at || null,
-        raw: { url, data },
-      };
-    }
-
-    return null;
-  }
-
-  // ── Active probing: fetch the usage endpoint directly ───────────────────
+  // ── Direct probe of the usage endpoint ─────────────────────────────────
   async function probeUsage() {
+    if (!orgId) return;
     try {
-      // Determine the org ID from the page URL or from a stored bootstrap call
-      const orgMatch = window.location.pathname.match(/\/orgs?\/([\w-]+)/);
-      let orgId = orgMatch?.[1];
+      const [uResp, rlResp] = await Promise.all([
+        fetch(`/api/organizations/${orgId}/usage`,       { credentials: 'include' }),
+        fetch(`/api/organizations/${orgId}/rate_limits`, { credentials: 'include' }),
+      ]);
 
-      // Fallback: try to find it from the page's react/redux state or meta
-      if (!orgId) {
-        const metaOrg = document.querySelector('meta[name="org-id"]');
-        orgId = metaOrg?.content;
+      let planName = null;
+      if (rlResp.ok) {
+        const rl = await rlResp.json();
+        planName = parseTierName(rl.rate_limit_tier);
       }
 
-      if (!orgId) return; // Can't determine org — wait for intercepted responses
+      if (uResp.ok) {
+        const data = await uResp.json();
+        handleUsageResponse(data);
 
-      const endpoints = [
-        `/api/organizations/${orgId}/usage`,
-        `/api/organizations/${orgId}/limits`,
-      ];
-
-      for (const path of endpoints) {
-        const resp = await fetch(`https://claude.ai${path}`, {
-          credentials: 'include',
-          headers: { 'Content-Type': 'application/json' },
-        });
-        if (resp.ok) {
-          const data = await resp.json();
-          forwardToBackground(path, data);
-          break;
+        // Attach plan name via a second message if we got it
+        if (planName) {
+          chrome.runtime.sendMessage({ type: 'PLAN_NAME', payload: planName }).catch(() => {});
         }
       }
     } catch (_) {}
   }
 
-  // Also listen for messages from the background (on-demand refresh)
+  // ── Turn "default_claude_max_5x" → "Claude Max 5×" ─────────────────────
+  function parseTierName(tier) {
+    if (!tier) return null;
+    // e.g. "default_claude_max_5x" → "Claude Max 5×"
+    //      "default_claude_pro"    → "Claude Pro"
+    //      "default_claude_free"   → "Claude Free"
+    const cleaned = tier
+      .replace(/^default_/, '')          // strip "default_"
+      .replace(/_(\d+)x$/, ' $1×')      // "_5x" → " 5×"
+      .replace(/_/g, ' ')               // remaining underscores → spaces
+      .replace(/\bclaude\b/gi, 'Claude') // capitalise Claude
+      .replace(/\bmax\b/gi, 'Max')
+      .replace(/\bpro\b/gi, 'Pro')
+      .replace(/\bfree\b/gi, 'Free')
+      .replace(/\bteam\b/gi, 'Team')
+      .trim();
+    return cleaned;
+  }
+
+  // ── Listen for on-demand probes from the background ─────────────────────
   chrome.runtime.onMessage.addListener((msg) => {
     if (msg.type === 'PROBE_NOW') probeUsage();
   });
 
-  // Initial probe after the page settles
-  setTimeout(probeUsage, 2000);
-
-  // ── Auto-refresh every 60 seconds while this tab is active ──────────────
-  let probeInterval = null;
-
+  // ── Auto-refresh every 60 s while tab is visible ────────────────────────
   function startProbing() {
     if (probeInterval) return;
     probeInterval = setInterval(probeUsage, 60_000);
   }
-
   function stopProbing() {
-    if (probeInterval) {
-      clearInterval(probeInterval);
-      probeInterval = null;
-    }
+    clearInterval(probeInterval);
+    probeInterval = null;
   }
 
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible') {
       startProbing();
-      probeUsage(); // immediate refresh on tab focus
+      probeUsage();
     } else {
       stopProbing();
     }
   });
 
   if (document.visibilityState === 'visible') startProbing();
+
+  // Initial attempt: if orgId isn't in a URL yet, try after DOM settles
+  setTimeout(() => {
+    if (!orgId) {
+      // Last resort: try to find org ID in the page's JS globals
+      try {
+        const scripts = [...document.querySelectorAll('script')];
+        for (const s of scripts) {
+          const m = s.textContent.match(/"uuid"\s*:\s*"([\w-]{36})"/);
+          if (m) { orgId = m[1]; probeUsage(); break; }
+        }
+      } catch (_) {}
+    } else {
+      probeUsage();
+    }
+  }, 2500);
 })();

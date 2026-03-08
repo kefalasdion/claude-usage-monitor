@@ -10,41 +10,71 @@
   <div class="container">
     <header>
       <img src="../icons/icon48.png" alt="Claude" class="logo" />
-      <h1>Claude Usage</h1>
+      <div class="header-text">
+        <h1>Claude Usage</h1>
+        <span class="plan-badge" id="plan-name">—</span>
+      </div>
     </header>
 
+    <!-- No data yet -->
     <div id="state-loading" class="state">
-      <p class="muted">Waiting for data&hellip;</p>
+      <p class="muted">Waiting for data…</p>
       <p class="hint">Open <a href="https://claude.ai" target="_blank">claude.ai</a> while logged in.</p>
     </div>
 
+    <!-- Data available -->
     <div id="state-data" class="state hidden">
-      <div class="plan-badge" id="plan-name">Pro</div>
 
-      <div class="usage-numbers">
-        <span id="used">—</span>
-        <span class="sep">/</span>
-        <span id="limit">—</span>
-        <span class="label">messages</span>
+      <!-- 5-hour window -->
+      <div class="window-block">
+        <div class="window-header">
+          <span class="window-label">5-hour window</span>
+          <span class="window-pct" id="pct-5h">0%</span>
+        </div>
+        <div class="progress-track">
+          <div class="progress-bar" id="bar-5h"></div>
+        </div>
+        <div class="window-reset">
+          Resets <span id="reset-5h">—</span>
+        </div>
       </div>
 
-      <div class="progress-track">
-        <div class="progress-bar" id="progress-bar"></div>
+      <!-- 7-day window -->
+      <div class="window-block">
+        <div class="window-header">
+          <span class="window-label">7-day window</span>
+          <span class="window-pct" id="pct-7d">0%</span>
+        </div>
+        <div class="progress-track">
+          <div class="progress-bar" id="bar-7d"></div>
+        </div>
+        <div class="window-reset">
+          Resets <span id="reset-7d">—</span>
+        </div>
       </div>
-      <div class="progress-pct" id="progress-pct">0%</div>
+
+      <!-- 7-day Sonnet (shown only when non-null) -->
+      <div class="window-block" id="sonnet-block" style="display:none">
+        <div class="window-header">
+          <span class="window-label">7-day Sonnet</span>
+          <span class="window-pct" id="pct-sonnet">0%</span>
+        </div>
+        <div class="progress-track">
+          <div class="progress-bar" id="bar-sonnet"></div>
+        </div>
+        <div class="window-reset">
+          Resets <span id="reset-sonnet">—</span>
+        </div>
+      </div>
 
       <div class="meta-row">
-        <span class="meta-label">Resets</span>
-        <span class="meta-value" id="resets-at">—</span>
-      </div>
-      <div class="meta-row">
-        <span class="meta-label">Updated</span>
+        <span class="meta-label">Last updated</span>
         <span class="meta-value" id="updated-at">—</span>
       </div>
     </div>
 
     <footer>
-      <button id="btn-refresh" title="Refresh now">&#x21bb; Refresh</button>
+      <button id="btn-refresh" title="Refresh now">↻ Refresh</button>
     </footer>
   </div>
   <script src="popup.js"></script>

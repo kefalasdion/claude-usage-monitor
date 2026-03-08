@@ -1,56 +1,70 @@
 'use strict';
 
 // ── DOM refs ─────────────────────────────────────────────────────────────────
-const stateLoading = document.getElementById('state-loading');
-const stateData    = document.getElementById('state-data');
-const elPlanName   = document.getElementById('plan-name');
-const elUsed       = document.getElementById('used');
-const elLimit      = document.getElementById('limit');
-const elBar        = document.getElementById('progress-bar');
-const elPct        = document.getElementById('progress-pct');
-const elResetsAt   = document.getElementById('resets-at');
-const elUpdatedAt  = document.getElementById('updated-at');
-const btnRefresh   = document.getElementById('btn-refresh');
+const stateLoading  = document.getElementById('state-loading');
+const stateData     = document.getElementById('state-data');
+const elPlanName    = document.getElementById('plan-name');
+
+const elPct5h       = document.getElementById('pct-5h');
+const elBar5h       = document.getElementById('bar-5h');
+const elReset5h     = document.getElementById('reset-5h');
+
+const elPct7d       = document.getElementById('pct-7d');
+const elBar7d       = document.getElementById('bar-7d');
+const elReset7d     = document.getElementById('reset-7d');
+
+const sonnetBlock   = document.getElementById('sonnet-block');
+const elPctSonnet   = document.getElementById('pct-sonnet');
+const elBarSonnet   = document.getElementById('bar-sonnet');
+const elResetSonnet = document.getElementById('reset-sonnet');
+
+const elUpdatedAt   = document.getElementById('updated-at');
+const btnRefresh    = document.getElementById('btn-refresh');
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-function pct(used, limit) {
-  if (!limit || limit <= 0) return 0;
-  return Math.min(100, Math.round((used / limit) * 100));
+function applyBar(barEl, pct) {
+  barEl.style.width = `${Math.min(100, pct)}%`;
+  barEl.className   = 'progress-bar';
+  if (pct >= 90)      barEl.classList.add('red');
+  else if (pct >= 70) barEl.classList.add('amber');
 }
 
-function formatTime(iso) {
+function formatReset(iso) {
   if (!iso) return '—';
   try {
-    const d = new Date(iso);
+    const d   = new Date(iso);
     const now = new Date();
-    const diffMs = d - now;
-
-    if (diffMs > 0) {
-      const h = Math.floor(diffMs / 3_600_000);
-      const m = Math.floor((diffMs % 3_600_000) / 60_000);
-      if (h > 0) return `in ${h}h ${m}m`;
-      return `in ${m}m`;
+    const ms  = d - now;
+    if (ms <= 0) return 'soon';
+    const h   = Math.floor(ms / 3_600_000);
+    const m   = Math.floor((ms % 3_600_000) / 60_000);
+    if (h >= 24) {
+      const days = Math.floor(h / 24);
+      return `in ${days}d ${h % 24}h`;
     }
-    return d.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+    return h > 0 ? `in ${h}h ${m}m` : `in ${m}m`;
   } catch (_) {
-    return iso;
+    return '—';
   }
 }
 
 function formatUpdated(iso) {
   if (!iso) return '—';
   try {
-    return new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-  } catch (_) {
-    return iso;
-  }
+    return new Date(iso).toLocaleTimeString([], {
+      hour: '2-digit', minute: '2-digit', second: '2-digit'
+    });
+  } catch (_) { return '—'; }
 }
 
 // ── Render ────────────────────────────────────────────────────────────────────
 
 function render(usage) {
-  if (!usage || (usage.used == null && usage.limit == null)) {
+  const has5h = usage?.fiveHour?.utilization != null;
+  const has7d = usage?.sevenDay?.utilization != null;
+
+  if (!usage || (!has5h && !has7d)) {
     stateLoading.classList.remove('hidden');
     stateData.classList.add('hidden');
     return;
@@ -61,30 +75,40 @@ function render(usage) {
 
   elPlanName.textContent = usage.planName || 'Claude';
 
-  const used  = usage.used  ?? '—';
-  const limit = usage.limit ?? '—';
-  elUsed.textContent  = used;
-  elLimit.textContent = limit;
+  // 5-hour window
+  if (has5h) {
+    const p = Math.round(usage.fiveHour.utilization);
+    elPct5h.textContent = `${p}%`;
+    applyBar(elBar5h, p);
+    elReset5h.textContent = formatReset(usage.fiveHour.resetsAt);
+  }
 
-  const p = (usage.used != null && usage.limit != null) ? pct(usage.used, usage.limit) : 0;
-  elPct.textContent   = `${p}%`;
-  elBar.style.width   = `${p}%`;
-  elBar.className     = 'progress-bar';
-  if (p >= 90)      elBar.classList.add('red');
-  else if (p >= 70) elBar.classList.add('amber');
+  // 7-day window
+  if (has7d) {
+    const p = Math.round(usage.sevenDay.utilization);
+    elPct7d.textContent = `${p}%`;
+    applyBar(elBar7d, p);
+    elReset7d.textContent = formatReset(usage.sevenDay.resetsAt);
+  }
 
-  elResetsAt.textContent  = formatTime(usage.resetsAt);
+  // 7-day Sonnet (optional)
+  const hasSonnet = usage.sevenDaySonnet?.utilization != null;
+  sonnetBlock.style.display = hasSonnet ? '' : 'none';
+  if (hasSonnet) {
+    const p = Math.round(usage.sevenDaySonnet.utilization);
+    elPctSonnet.textContent = `${p}%`;
+    applyBar(elBarSonnet, p);
+    elResetSonnet.textContent = formatReset(usage.sevenDaySonnet.resetsAt);
+  }
+
   elUpdatedAt.textContent = formatUpdated(usage.updatedAt);
 }
 
-// ── Load stored data ──────────────────────────────────────────────────────────
+// ── Load from storage ─────────────────────────────────────────────────────────
 
 function loadUsage() {
   chrome.runtime.sendMessage({ type: 'GET_USAGE' }, (response) => {
-    if (chrome.runtime.lastError) {
-      render(null);
-      return;
-    }
+    if (chrome.runtime.lastError) { render(null); return; }
     render(response?.usage || null);
   });
 }
@@ -92,22 +116,19 @@ function loadUsage() {
 // ── Refresh button ────────────────────────────────────────────────────────────
 
 btnRefresh.addEventListener('click', async () => {
-  btnRefresh.disabled = true;
-  btnRefresh.textContent = '…';
+  btnRefresh.disabled     = true;
+  btnRefresh.textContent  = '…';
 
-  // Ask all claude.ai tabs to probe immediately
   const tabs = await chrome.tabs.query({ url: 'https://claude.ai/*' });
-  const probes = tabs.map((tab) =>
-    chrome.tabs.sendMessage(tab.id, { type: 'PROBE_NOW' }).catch(() => {})
+  await Promise.all(
+    tabs.map((t) => chrome.tabs.sendMessage(t.id, { type: 'PROBE_NOW' }).catch(() => {}))
   );
-  await Promise.all(probes);
 
-  // Give the content script a moment to respond then reload from storage
   setTimeout(() => {
     loadUsage();
-    btnRefresh.disabled = false;
+    btnRefresh.disabled    = false;
     btnRefresh.textContent = '↻ Refresh';
-  }, 1500);
+  }, 1800);
 });
 
 // ── Init ──────────────────────────────────────────────────────────────────────

@@ -1,62 +1,59 @@
 /**
  * Background service worker (Manifest V3).
  *
- * Responsibilities:
- *  - Receive USAGE_DATA messages from the content script.
- *  - Persist the latest usage to chrome.storage.local.
- *  - Update the toolbar badge (colour + text).
- *  - Set an alarm to probe every 60 s even when no message arrives.
+ * Data shape stored in chrome.storage.local:
+ * {
+ *   claudeUsage: {
+ *     planName:   "Claude Max 5×",
+ *     fiveHour:   { utilization: 46, resetsAt: "2026-03-08T21:00:00Z" },
+ *     sevenDay:   { utilization: 20, resetsAt: "2026-03-13T07:00:00Z" },
+ *     sevenDaySonnet: { utilization: 4, resetsAt: "..." } | undefined,
+ *     updatedAt:  "2026-03-08T19:34:00Z"
+ *   }
+ * }
  */
 
 'use strict';
 
 const STORAGE_KEY = 'claudeUsage';
 const ALARM_NAME  = 'claudeUsageRefresh';
-const PROBE_MSG   = { type: 'PROBE_NOW' };
 
 // ── Badge helpers ────────────────────────────────────────────────────────────
 
-function pct(used, limit) {
-  if (!limit || limit <= 0) return 0;
-  return Math.min(100, Math.round((used / limit) * 100));
-}
-
-function badgeColor(percentage) {
-  if (percentage >= 90) return '#e53935'; // red
-  if (percentage >= 70) return '#fb8c00'; // amber
-  return '#43a047';                        // green
+function badgeColor(pct) {
+  if (pct == null) return '#888888';
+  if (pct >= 90)   return '#e53935'; // red
+  if (pct >= 70)   return '#fb8c00'; // amber
+  return '#43a047';                   // green
 }
 
 function updateBadge(usage) {
-  if (!usage) {
+  if (!usage || usage.fiveHour?.utilization == null) {
     chrome.action.setBadgeText({ text: '?' });
     chrome.action.setBadgeBackgroundColor({ color: '#888888' });
+    chrome.action.setTitle({ title: 'Claude Usage Monitor — waiting for data' });
     return;
   }
 
-  const { used, limit } = usage;
-
-  if (used == null || limit == null) {
-    chrome.action.setBadgeText({ text: '—' });
-    chrome.action.setBadgeBackgroundColor({ color: '#888888' });
-    return;
-  }
-
-  const p = pct(used, limit);
-  const text = p >= 100 ? 'MAX' : `${p}%`;
+  const pct  = Math.round(usage.fiveHour.utilization);
+  const text = pct >= 100 ? 'MAX' : `${pct}%`;
 
   chrome.action.setBadgeText({ text });
-  chrome.action.setBadgeBackgroundColor({ color: badgeColor(p) });
-  chrome.action.setTitle({ title: `Claude Usage: ${used}/${limit} messages (${p}%)` });
+  chrome.action.setBadgeBackgroundColor({ color: badgeColor(pct) });
+  chrome.action.setTitle({
+    title: `Claude Usage\n5-hour: ${pct}%  |  7-day: ${Math.round(usage.sevenDay?.utilization ?? 0)}%`
+  });
 }
 
-// ── Persist and broadcast usage ──────────────────────────────────────────────
+// ── Persist usage ────────────────────────────────────────────────────────────
 
-async function saveUsage(usage) {
-  const record = {
-    ...usage,
-    updatedAt: new Date().toISOString(),
-  };
+async function saveUsage(partial) {
+  // Merge with existing record so PLAN_NAME and USAGE_DATA messages can
+  // arrive independently without overwriting each other.
+  const stored = await chrome.storage.local.get(STORAGE_KEY);
+  const prev   = stored[STORAGE_KEY] || {};
+  const record = { ...prev, ...partial, updatedAt: new Date().toISOString() };
+
   await chrome.storage.local.set({ [STORAGE_KEY]: record });
   updateBadge(record);
 }
@@ -68,28 +65,33 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     saveUsage(msg.payload);
     sendResponse({ ok: true });
   }
+
+  if (msg.type === 'PLAN_NAME' && msg.payload) {
+    saveUsage({ planName: msg.payload });
+    sendResponse({ ok: true });
+  }
+
   if (msg.type === 'GET_USAGE') {
     chrome.storage.local.get(STORAGE_KEY, (result) => {
       sendResponse({ usage: result[STORAGE_KEY] || null });
     });
-    return true; // keep channel open for async sendResponse
+    return true; // async sendResponse
   }
 });
 
-// ── Alarm: probe active claude.ai tabs every 60 s ────────────────────────────
+// ── Alarm: prod all claude.ai tabs every 60 s ────────────────────────────────
 
 chrome.alarms.create(ALARM_NAME, { periodInMinutes: 1 });
 
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name !== ALARM_NAME) return;
-
   const tabs = await chrome.tabs.query({ url: 'https://claude.ai/*' });
   for (const tab of tabs) {
-    chrome.tabs.sendMessage(tab.id, PROBE_MSG).catch(() => {});
+    chrome.tabs.sendMessage(tab.id, { type: 'PROBE_NOW' }).catch(() => {});
   }
 });
 
-// ── On install / startup: restore badge from storage ─────────────────────────
+// ── Restore badge on startup ─────────────────────────────────────────────────
 
 async function restoreBadge() {
   const result = await chrome.storage.local.get(STORAGE_KEY);
